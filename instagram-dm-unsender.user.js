@@ -1,550 +1,1240 @@
+
 // ==UserScript==
-// @name dsddddddddddddddd
-// @icon https://www.instagram.com/favicon.ico
-// @match https://*.instagram.com/*
-// @run-at document-idle
+
+// @name				instagram-dm-unsender
+// @license				MIT
+// @copyright				Copyright (c) 2023, Romain Lebesle <oss@thoughtsunificator.me> (https://thoughtsunificator.me)
+// @namespace				https://thoughtsunificator.me/
+// @author				Romain Lebesle <oss@thoughtsunificator.me> (https://thoughtsunificator.me)
+// @homepageURL				https://thoughtsunificator.me/
+// @supportURL				https://thoughtsunificator.me/
+// @contributionURL				https://thoughtsunificator.me/
+// @icon				https://www.instagram.com/favicon.ico
+// @version				0.6.1
+// @updateURL				https://raw.githubusercontent.com/thoughtsunificator/instagram-dm-unsender/userscript/idmu.user.js
+// @downloadURL				https://raw.githubusercontent.com/thoughtsunificator/instagram-dm-unsender/userscript/idmu.user.js
+// @description				Simple script to unsend all DMs in a thread on instagram.com
+// @run-at				document-end
+// @include				/^https://(www\.)?instagram\.com/*/
+
 // ==/UserScript==
-(function () {
-  'use strict';
-  // Configuration
-  const TIMEOUT_MS = 10000; // Max time to wait for any UI step (icon/menu/dialog/removal)
-  const MIN_ACTION_DELAY_MS = 100; // Minimum delay between each UI action
-  // Selectors
-  const conversationSelector = 'div[aria-label^="Messages in conversation with"]';
-  const messageRowSelector = 'div[role="row"]:has(div[role="gridcell"])';
-  const likeBubbleSelector = 'div[role="button"][aria-label="Double tap to like"]';
-  const moreSvgSelector = 'svg[aria-label^="More options"]'; // Generalized for both sent and received
-  let lastUrl = window.location.href;
-  let isActive = false;
-  let abortController = null;
-  let removeInteractionBlockers = null;
-  let scrollState = null;
-  let cleanupFns = [];
-  let totalProcessed = 0;
-  const last = (arr) => arr[arr.length - 1];
-  const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-  const actionPause = () => sleep(MIN_ACTION_DELAY_MS);
-  const withAbort = (promise, signal, label = 'operation') =>
-    new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error(`Aborted: ${label}`));
-      const onAbort = () => reject(new Error(`Aborted: ${label}`));
-      signal?.addEventListener('abort', onAbort, { once: true });
-      promise.then(
-        v => { signal?.removeEventListener('abort', onAbort); resolve(v); },
-        e => { signal?.removeEventListener('abort', onAbort); reject(e); }
-      );
-    });
-  const withTimeoutAbort = (promise, ms, signal, label) =>
-    Promise.race([
-      withAbort(promise, signal, label),
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout waiting for ${label}`)), ms))
-    ]);
-  function waitForSelector(selector, { root = document, signal, label = selector } = {}) {
-    const found = root.querySelector(selector);
-    if (found) return Promise.resolve(found);
-    return new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error(`Aborted: ${label}`));
-      const obs = new MutationObserver(() => {
-        const el = root.querySelector(selector);
-        if (el) { obs.disconnect(); resolve(el); }
-      });
-      obs.observe(root, { childList: true, subtree: true });
-      const onAbort = () => { obs.disconnect(); reject(new Error(`Aborted: ${label}`)); };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      cleanupFns.push(() => { try { obs.disconnect(); } catch {} signal?.removeEventListener?.('abort', onAbort); });
-    });
-  }
-  function waitForMatch({ root = document, match, signal, label = 'match' } = {}) {
-    const scan = (node) => {
-      if (node instanceof Element && match(node)) return node;
-      if (!(node instanceof Element) || !node.querySelectorAll) return null;
-      for (const el of node.querySelectorAll('*')) if (match(el)) return el;
-      return null;
-    };
-    const now = scan(root);
-    if (now) return Promise.resolve(now);
-    return new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error(`Aborted: ${label}`));
-      const obs = new MutationObserver((muts) => {
-        for (const mut of muts) {
-          for (const n of mut.addedNodes) {
-            const hit = scan(n);
-            if (hit) { obs.disconnect(); resolve(hit); return; }
-          }
-        }
-      });
-      obs.observe(root, { childList: true, subtree: true });
-      const onAbort = () => { obs.disconnect(); reject(new Error(`Aborted: ${label}`)); };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      cleanupFns.push(() => { try { obs.disconnect(); } catch {} signal?.removeEventListener?.('abort', onAbort); });
-    });
-  }
-  function waitForRemoval(node, { root = document, signal, label = 'removal' } = {}) {
-    if (!node || !node.isConnected) return Promise.resolve(true);
-    return new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error(`Aborted: ${label}`));
-      const obs = new MutationObserver(() => {
-        if (!node.isConnected) { obs.disconnect(); resolve(true); }
-      });
-      obs.observe(root, { childList: true, subtree: true });
-      const onAbort = () => { obs.disconnect(); reject(new Error(`Aborted: ${label}`)); };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      cleanupFns.push(() => { try { obs.disconnect(); } catch {} signal?.removeEventListener?.('abort', onAbort); });
-    });
-  }
-  const getConversationRoot = () =>
-    document.querySelector(conversationSelector) || document.body;
-  const getRows = () =>
-    Array.from(document.querySelectorAll(messageRowSelector))
-      .filter(el => el.offsetParent !== null);
-  function getScrollableAncestor(el, max = 10) {
-    let cur = el;
-    for (let i = 0; i < max && cur; i++) {
-      cur = cur.parentElement;
-      if (!cur) break;
-      const cs = getComputedStyle(cur);
-      const oy = cs.overflowY;
-      const scrollable = (oy === 'auto' || oy === 'scroll') && cur.scrollHeight > cur.clientHeight + 1;
-      if (scrollable) return cur;
-    }
-    const root = getConversationRoot();
-    const cs = root ? getComputedStyle(root) : null;
-    if (root && cs && (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && root.scrollHeight > root.clientHeight + 1) {
-      return root;
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-  function viewProfileState() {
-    const root = getConversationRoot();
-    const link = Array.from(root.querySelectorAll('a')).find(a => (a.textContent || '').trim() === 'View profile');
-    if (!link) return { found: false, visible: false };
-    const rect = link.getBoundingClientRect();
-    const vh = window.innerHeight || document.documentElement.clientHeight;
-    const vw = window.innerWidth || document.documentElement.clientWidth;
-    const visible = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
-    return { found: true, visible, el: link };
-  }
-  function scrollRowIntoView(scroller, row, block = 'top', pad = 12) {
-    const sRect = scroller.getBoundingClientRect();
-    const rRect = row.getBoundingClientRect();
-    let delta;
-    if (block === 'top') {
-      delta = (rRect.top - sRect.top) - pad;
-    } else {
-      delta = (rRect.bottom - sRect.bottom) + pad;
-    }
-    const before = scroller.scrollTop;
-    scroller.scrollTop += delta;
-    return scroller.scrollTop !== before;
-  }
-  const freezeScroll = () => {
-    const body = document.body;
-    const html = document.documentElement;
-    const y = window.scrollY || html.scrollTop || body.scrollTop || 0;
-    const x = window.scrollX || html.scrollLeft || body.scrollLeft || 0;
-    scrollState = { x, y, styles: {
-      position: body.style.position,
-      width: body.style.width,
-      overflow: body.style.overflow,
-      top: body.style.top,
-      left: body.style.left,
-      right: body.style.right
-    }};
-    body.style.position = 'fixed';
-    body.style.width = '100%';
-    body.style.overflow = 'hidden';
-    body.style.top = `-${y}px`;
-    body.style.left = `-${x}px`;
-    body.style.right = '0';
-  };
-  const unfreezeScroll = () => {
-    const body = document.body;
-    if (!scrollState) return;
-    const { x, y, styles } = scrollState;
-    body.style.position = styles.position;
-    body.style.width = styles.width;
-    body.style.overflow = styles.overflow;
-    body.style.top = styles.top;
-    body.style.left = styles.left;
-    body.style.right = styles.right;
-    scrollState = null;
-    window.scrollTo(x, y);
-  };
-  const addInteractionBlockers = () => {
-    const BLOCKED_EVENTS = [
-      'click','dblclick','auxclick','contextmenu',
-      'mousedown','mouseup','pointerdown','pointerup','pointermove',
-      'touchstart','touchmove','touchend','wheel',
-      'dragstart','selectstart','keydown','keyup'
-    ];
-    const handler = (e) => {
-      if (!e.isTrusted) return;
-      const target = e.target;
-      const insidePanel = target && typeof target.closest === 'function'
-        ? target.closest('#processControlPanel')
-        : null;
-      if (insidePanel) return;
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
-      return false;
-    };
-    const registrations = [];
-    for (const evt of BLOCKED_EVENTS) {
-      const opts = { capture: true, passive: false };
-      window.addEventListener(evt, handler, opts);
-      document.addEventListener(evt, handler, opts);
-      registrations.push({ evt, handler, opts });
-    }
-    return () => {
-      for (const { evt, handler, opts } of registrations) {
-        window.removeEventListener(evt, handler, opts);
-        document.removeEventListener(evt, handler, opts);
-      }
-    };
-  };
-  const setStatus = (text) => {
-    const el = document.getElementById('processStatusBar');
-    if (el) el.textContent = text;
-  };
-  const startProcess = (type) => {
-    if (isActive) return;
-    isActive = true;
-    totalProcessed = 0;
-    abortController = new AbortController();
-    console.log(`[DM Processor] Starting ${type} run.`);
-    const unsendBtn = document.getElementById('unsendBtn');
-    const deleteBtn = document.getElementById('deleteBtn');
-    if (unsendBtn) unsendBtn.style.display = 'none';
-    if (deleteBtn) deleteBtn.style.display = 'none';
-    const overlay = document.createElement('div');
-    overlay.id = 'processOverlay';
-    overlay.style.cssText = [
-      'position: fixed',
-      'top: 0','left: 0','width: 100vw','height: 100vh',
-      'background-color: rgba(0, 0, 0, 0.2)',
-      'z-index: 2147483646',
-      'pointer-events: auto',
-      'cursor: not-allowed'
-    ].join(';');
-    const stopEvent = (e) => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
-    ['pointerdown','pointerup','pointermove','mousedown','mouseup','click','contextmenu','touchstart','touchmove','touchend','wheel','dragstart']
-      .forEach(evt => overlay.addEventListener(evt, stopEvent, true));
-    document.body.appendChild(overlay);
-    const controlPanel = document.createElement('div');
-    controlPanel.id = 'processControlPanel';
-    controlPanel.style.cssText = [
-      'position: fixed','top: 15px','right: 15px',
-      'z-index: 2147483647',
-      'display: flex','align-items: center','gap: 8px',
-      'background: white','padding: 8px 12px',
-      'border-radius: 8px','box-shadow: 0 2px 10px rgba(0,0,0,0.2)'
-    ].join(';');
-    controlPanel.innerHTML = `
-      <div id="processStatusBar" style="color: #8e8e8e; font-size: 12px; font-weight: bold; white-space: nowrap; background-color: #efefef; padding: 4px 8px; border-radius: 6px;">
-        Interaction Blocked
-      </div>
-      <button id="cancelProcessBtn" style="background-color: #dbdbdb; color: black; border: none; border-radius: 8px; padding: 6px 12px; font-weight: bold; cursor: pointer;">Cancel</button>
-    `;
-    document.body.appendChild(controlPanel);
-    document.getElementById('cancelProcessBtn').onclick = stopProcess;
-    removeInteractionBlockers = addInteractionBlockers();
-    freezeScroll();
-    const runFn = type === 'unsend' ? runUnsendAll : runDeleteAll;
-    runFn(abortController.signal)
-      .then(() => { if (!isActive) return; stopProcess(); })
-      .catch((e) => { console.error(`[DM Processor] Error during ${type} run:`, e); stopProcess(); });
-  };
-  const stopProcess = () => {
-    if (!isActive && !document.getElementById('processOverlay')) return;
-    console.log('[DM Processor] Stopping.');
-    isActive = false;
-    try { abortController?.abort(); } catch {}
-    abortController = null;
-    try { removeInteractionBlockers?.(); } catch {}
-    removeInteractionBlockers = null;
-    try { cleanupFns.forEach(fn => fn()); } catch {}
-    cleanupFns = [];
-    unfreezeScroll();
-    document.getElementById('processOverlay')?.remove();
-    document.getElementById('processControlPanel')?.remove();
-    const unsendBtn = document.getElementById('unsendBtn');
-    const deleteBtn = document.getElementById('deleteBtn');
-    if (unsendBtn) unsendBtn.style.display = 'inline-block';
-    if (deleteBtn) deleteBtn.style.display = 'inline-block';
-  };
-  const injectButtons = (targetNode, insertionPoint) => {
-    if (document.getElementById('unsendBtn') && document.getElementById('deleteBtn')) return;
-    const unsendBtn = document.createElement('button');
-    unsendBtn.textContent = 'Unsend My All';
-    unsendBtn.id = 'unsendBtn';
-    unsendBtn.style.cssText = 'background-color: #0095f6; color: white; border: none; border-radius: 8px; padding: 6px 12px; font-weight: bold; cursor: pointer; margin-left: auto;';
-    unsendBtn.onclick = () => startProcess('unsend');
-    targetNode.insertBefore(unsendBtn, insertionPoint);
-    const deleteBtn = document.createElement('button');
-    deleteBtn.textContent = 'Delete Others All';
-    deleteBtn.id = 'deleteBtn';
-    deleteBtn.style.cssText = 'background-color: #ef4444; color: white; border: none; border-radius: 8px; padding: 6px 12px; font-weight: bold; cursor: pointer; margin-left: 8px; margin-right: 12px;';
-    deleteBtn.onclick = () => startProcess('delete');
-    targetNode.insertBefore(deleteBtn, insertionPoint);
-  };
-  const onUrlChange = () => {
-    const currentUrl = window.location.href;
-    if (currentUrl !== lastUrl) {
-      lastUrl = currentUrl;
-      if (isActive) {
-        console.warn('[DM Processor] URL changed during run. Stopping.');
-        stopProcess();
-      }
-    }
-    const isDmThreadPage = window.location.pathname.startsWith('/direct/t/');
-    if (isDmThreadPage) {
-      const iconContainer = document.querySelector('svg[aria-label="Conversation information"]')?.closest('div[role="button"]');
-      if (iconContainer?.parentElement?.parentElement) {
-        const headerBar = iconContainer.parentElement.parentElement;
-        if (headerBar.querySelector('a[aria-label^="Open the profile page of"]')) {
-          injectButtons(headerBar, iconContainer.parentElement);
-        }
-      }
-    } else {
-      document.getElementById('unsendBtn')?.remove();
-      document.getElementById('deleteBtn')?.remove();
-    }
-  };
-  async function runUnsendAll(signal) {
-    setStatus('Unsending...');
-    const conversationDiv = await withTimeoutAbort(
-      waitForSelector(conversationSelector, { root: document, signal, label: 'conversation container' }),
-      TIMEOUT_MS, signal, 'conversation container'
-    );
-    const firstRow = getRows()[0];
-    if (firstRow) {
-      const scrollerAtStart = getScrollableAncestor(firstRow);
-      scrollerAtStart.scrollTop = scrollerAtStart.scrollHeight;
-    }
-    await sleep(800);
-    let newMessagesResolver = null;
-    const waitForNewMessages = (timeoutMs = 60000) => new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error('Aborted: wait new messages'));
-      if (newMessagesResolver) {
-        const check = () => { if (!newMessagesResolver) resolve(); else setTimeout(check, 50); };
-        check(); return;
-      }
-      let timedOut = false;
-      const to = setTimeout(() => {
-        timedOut = true;
-        newMessagesResolver = null;
-        reject(new Error('Timeout waiting for new messages'));
-      }, timeoutMs);
-      const onAbort = () => {
-        clearTimeout(to);
-        newMessagesResolver = null;
-        reject(new Error('Aborted: wait new messages'));
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      newMessagesResolver = () => {
-        if (timedOut) return;
-        clearTimeout(to);
-        signal?.removeEventListener('abort', onAbort);
-        newMessagesResolver = null;
-        resolve();
-      };
-    });
-    const obsTarget = getConversationRoot();
-    const convObserver = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        if (m.addedNodes && m.addedNodes.length) {
-          if (newMessagesResolver) newMessagesResolver();
-          return;
-        }
-      }
-    });
-    convObserver.observe(obsTarget, { childList: true, subtree: true });
-    cleanupFns.push(() => { try { convObserver.disconnect(); } catch {} });
-    async function processRow(row, menuItemText, confirmText) {
-      if (signal?.aborted) throw new Error('Aborted: process row');
-      const scroller = getScrollableAncestor(row);
-      try { scrollRowIntoView(scroller, row, 'top', 16); } catch {}
-      await actionPause();
-      const hoverTarget = row.querySelector(likeBubbleSelector) || row;
-      hoverTarget.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
-      await actionPause();
-      const moreIcon = row.querySelector(moreSvgSelector) ||
-        await withTimeoutAbort(
-          waitForSelector(moreSvgSelector, { root: conversationDiv, signal, label: 'more options icon' }),
-          TIMEOUT_MS, signal, 'more options icon'
-        );
-      await actionPause();
-      const moreBtn = moreIcon.closest('div[role="button"]') || moreIcon;
-      moreBtn.click();
-      await actionPause();
-      const menuItem = await withTimeoutAbort(
-        waitForMatch({
-          root: document.body,
-          signal,
-          label: `${menuItemText} menu item`,
-          match: n => n.tagName === 'SPAN' && n.textContent.trim() === menuItemText && !!n.closest('div[role="dialog"]')
-        }),
-        TIMEOUT_MS, signal, `${menuItemText} menu item`
-      );
-      (menuItem.closest('div[role="button"]') || menuItem).click();
-      await actionPause();
-      const confirmBtn = await withTimeoutAbort(
-        waitForMatch({
-          root: document.body,
-          signal,
-          label: `${confirmText} confirm button`,
-          match: n => n.tagName === 'BUTTON' && n.textContent.trim() === confirmText
-        }),
-        TIMEOUT_MS, signal, `${confirmText} confirm button`
-      );
-      confirmBtn.click();
-      await actionPause();
-      await withTimeoutAbort(
-        waitForRemoval(row, { root: conversationDiv, signal, label: 'message row removal' }),
-        TIMEOUT_MS, signal, 'message removal'
-      );
-      await actionPause();
-    }
-    function messageRows(convRoot, isOwn) {
-      const rows = [...convRoot.querySelectorAll(messageRowSelector)]
-        .filter(el => el.offsetParent !== null);
-      return rows.filter(row => {
-        const bubble = row.querySelector(likeBubbleSelector);
-        if (!bubble) return false;
-        if (row.innerText.includes('Unsupported message')) return false;
-        const profileLink = row.querySelector('a[aria-label^="Open the profile page of"]');
-        return isOwn ? !profileLink : !!profileLink;
-      });
-    }
-    async function drainLoaded(convDiv, isOwn, menuItemText, confirmText) {
-      let count = 0;
-      while (!signal?.aborted) {
-        const rows = messageRows(convDiv, isOwn);
-        const row = last(rows);
-        if (!row) break;
-        try {
-          await processRow(row, menuItemText, confirmText);
-          count++;
-          totalProcessed++;
-          setStatus(`${isOwn ? 'Unsending' : 'Deleting'}... (${totalProcessed})`);
-        } catch (e) {
-          console.error('[DM Processor] Error processing row:', e);
-          if (/No eligible/.test(String(e?.message))) break;
-          throw e;
-        }
-      }
-      return count;
-    }
-    async function stepScrollUp() {
-      const state = viewProfileState();
-      if (state.found && state.visible) return false;
-      let rows = getRows();
-      if (!rows.length) {
-        try { await waitForNewMessages(60000); } catch { /* retry next loop */ }
-        return true;
-      }
-      const scroller = getScrollableAncestor(rows[0]);
-      const sRect = scroller.getBoundingClientRect();
-      let firstVis = rows.findIndex(r => {
-        const rr = r.getBoundingClientRect();
-        return rr.bottom > sRect.top + 1 && rr.top < sRect.bottom - 1;
-      });
-      if (firstVis === -1) firstVis = rows.length - 1;
-      const prevIdx = Math.max(0, firstVis - 1);
-      const prevRow = rows[prevIdx];
-      let moved = scrollRowIntoView(scroller, prevRow, 'top', 16);
-      if (!moved) {
-        const before = scroller.scrollTop;
-        scroller.scrollBy(0, -Math.max(80, Math.floor(scroller.clientHeight * 0.7)));
-        moved = scroller.scrollTop !== before;
-      }
-      if (!moved && scroller.scrollTop <= 1 && !(state.found && state.visible)) {
-        try { await waitForNewMessages(60000); } catch {}
-      } else {
-        await sleep(250);
-      }
-      return true;
-    }
-    while (!signal?.aborted) {
-      const removed = await drainLoaded(conversationDiv, true, 'Unsend', 'Unsend');
-      if (removed > 0) console.log(`[DM Processor] Unsent ${removed} message(s) this pass (total: ${totalProcessed}).`);
-      const profileState = viewProfileState();
-      if (profileState.found && profileState.visible && messageRows(conversationDiv, true).length === 0) {
-        console.log('[DM Processor] Reached top and no more eligible messages. Done.');
-        break;
-      }
-      const cont = await stepScrollUp();
-      if (!cont) break;
-    }
-    if (signal?.aborted) throw new Error('Aborted: run');
-  }
-  async function runDeleteAll(signal) {
-    setStatus('Deleting...');
-    const conversationDiv = await withTimeoutAbort(
-      waitForSelector(conversationSelector, { root: document, signal, label: 'conversation container' }),
-      TIMEOUT_MS, signal, 'conversation container'
-    );
-    const firstRow = getRows()[0];
-    if (firstRow) {
-      const scrollerAtStart = getScrollableAncestor(firstRow);
-      scrollerAtStart.scrollTop = scrollerAtStart.scrollHeight;
-    }
-    await sleep(800);
-    let newMessagesResolver = null;
-    const waitForNewMessages = (timeoutMs = 60000) => new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(new Error('Aborted: wait new messages'));
-      if (newMessagesResolver) {
-        const check = () => { if (!newMessagesResolver) resolve(); else setTimeout(check, 50); };
-        check(); return;
-      }
-      let timedOut = false;
-      const to = setTimeout(() => {
-        timedOut = true;
-        newMessagesResolver = null;
-        reject(new Error('Timeout waiting for new messages'));
-      }, timeoutMs);
-      const onAbort = () => {
-        clearTimeout(to);
-        newMessagesResolver = null;
-        reject(new Error('Aborted: wait new messages'));
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      newMessagesResolver = () => {
-        if (timedOut) return;
-        clearTimeout(to);
-        signal?.removeEventListener('abort', onAbort);
-        newMessagesResolver = null;
-        resolve();
-      };
-    });
-    const obsTarget = getConversationRoot();
-    const convObserver = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        if (m.addedNodes && m.addedNodes.length) {
-          if (newMessagesResolver) newMessagesResolver();
-          return;
-        }
-      }
-    });
-    convObserver.observe(obsTarget, { childList: true, subtree: true });
-    cleanupFns.push(() => { try { convObserver.disconnect(); } catch {} });
-    // The processRow and messageRows functions are shared, but with parameters
-    // For delete, use isOwn = false, menuItemText = 'Delete', confirmText = 'Delete'
-    while (!signal?.aborted) {
-      const removed = await drainLoaded(conversationDiv, false, 'Delete', 'Delete');
-      if (removed > 0) console.log(`[DM Processor] Deleted ${removed} message(s) this pass (total: ${totalProcessed}).`);
-      const profileState = viewProfileState();
-      if (profileState.found && profileState.visible && messageRows(conversationDiv, false).length === 0) {
-        console.log('[DM Processor] Reached top and no more eligible messages. Done.');
-        break;
-      }
-      const cont = await stepScrollUp();
-      if (!cont) break;
-    }
-    if (signal?.aborted) throw new Error('Aborted: run');
-  }
-  console.log('Instagram DM Processor active.');
-  new MutationObserver(onUrlChange).observe(document.body, { childList: true, subtree: true });
-  onUrlChange();
-})();
+
+
+(function (exports) {
+	'use strict';
+
+	/** @module instagram Helpers to mimick Instagram's look and feel */
+
+	const BUTTON_STYLE = {
+		"PRIMARY": "primary",
+		"SECONDARY": "secondary",
+	};
+
+	/**
+	 *
+	 * @param {HTMLButtonElement} buttonElement
+	 * @param {string}            styleName
+	 */
+	function applyButtonStyle(buttonElement, styleName) {
+		buttonElement.style.fontSize = "var(--system-14-font-size)";
+		buttonElement.style.color = "white";
+		buttonElement.style.border = "0px";
+		buttonElement.style.borderRadius = "8px";
+		buttonElement.style.padding = "8px";
+		buttonElement.style.fontWeight = "bold";
+		buttonElement.style.cursor = "pointer";
+		buttonElement.style.lineHeight = "var(--system-14-line-height)";
+		if(styleName) {
+			buttonElement.style.backgroundColor = `rgb(var(--ig-${styleName}-button))`;
+		}
+	}
+
+	/** @module menu-button Helpers to create buttons that can be used in IDMU's menu */
+
+
+	/**
+	 *
+	 * @param {Document} document
+	 * @param {string}   text
+	 * @param {string}   styleName
+	 * @returns {HTMLButtonElement}
+	 */
+	function createMenuButtonElement(document, text, styleName) {
+		const buttonElement = document.createElement("button");
+		buttonElement.textContent = text;
+		applyButtonStyle(buttonElement, styleName);
+		buttonElement.addEventListener("mouseover", () => {
+			buttonElement.style.filter = `brightness(1.15)`;
+		});
+		buttonElement.addEventListener("mouseout", () => {
+			buttonElement.style.filter = ``;
+		});
+		return buttonElement
+	}
+
+	/** @module menu IDMU's main menu */
+
+	/**
+	 * @param {Document} document
+	 * @returns {HTMLButtonElement}
+	 */
+	function createMenuElement(document) {
+		const menuElement = document.createElement("div");
+		menuElement.id = "idmu-menu";
+		menuElement.style.top = "20px";
+		menuElement.style.right = "430px";
+		menuElement.style.position = "fixed";
+		menuElement.style.zIndex = 999;
+		menuElement.style.display = "flex";
+		menuElement.style.gap = "10px";
+		menuElement.style.placeItems = "center";
+		return menuElement
+	}
+
+	/** @module async-events Utils module for finding elements asynchronously in the DOM */
+
+	/**
+	 *
+	 * @callback getElement
+	 * @returns {Element}
+	 */
+
+	/**
+	 *
+	 * @param {Element} target
+	 * @param {getElement} getElement
+	 * @param {AbortController} abortController
+	 * @returns {Promise<Element>}
+	 */
+	function waitForElement(target, getElement, abortController) {
+		return new Promise((resolve, reject) => {
+			let mutationObserver;
+			const abortHandler = () => {
+				if(mutationObserver) {
+					reject(new DOMException("Aborted: Disconnecting mutation observer...", "AbortError"));
+					mutationObserver.disconnect();
+				} else {
+					reject(new DOMException("Aborted", "AbortError"));
+				}
+			};
+			abortController.signal.addEventListener("abort", abortHandler);
+			let element = getElement();
+			if(element) {
+				resolve(element);
+				abortController.signal.removeEventListener("abort", abortHandler);
+			} else {
+				mutationObserver = new MutationObserver((mutations, observer) => {
+					element = getElement(mutations);
+					if(element) {
+						observer.disconnect();
+						resolve(element);
+						abortController.signal.removeEventListener("abort", abortHandler);
+					}
+				});
+				mutationObserver.observe(target, { subtree: true, childList:true });
+			}
+		})
+	}
+
+	/**
+	 *
+	 * @param {Element} clickTarget
+	 * @param {Element} target
+	 * @param {getElement} getElement
+	 * @param {AbortController} abortController
+	 * @returns {Element|Promise<Element>}
+	 */
+	function clickElementAndWaitFor(clickTarget, target, getElement, abortController) {
+		const promise = waitForElement(target, getElement, abortController);
+		clickTarget.click();
+		return getElement() || promise
+	}
+
+	/** @module ui-component Base class for any element that is a part of the UI. */
+
+
+	/**
+	 *
+	 * @abstract
+	 */
+	class UIComponent {
+		/**
+		 *
+		 * @param {Element} root
+		 * @param {object} identifier
+		 */
+		constructor(root, identifier={}) {
+			this.root = root;
+			this.identifier = identifier;
+		}
+
+		/**
+		 *
+		 * @param {Element} target
+		 * @param {function} getElement
+		 * @param {AbortController} abortController
+		 * @returns {Promise<Element>}
+		 */
+		waitForElement(target, getElement, abortController) {
+			return getElement() || waitForElement(target, getElement, abortController)
+		}
+
+		/**
+		 *
+		 * @param {Element} clickTarget
+		 * @param {Element} target
+		 * @param {function} getElement
+		 * @param {AbortController} abortController
+		 * @returns {Promise<Element>}
+		 */
+		clickElementAndWaitFor(clickTarget, target, getElement, abortController) {
+			return clickElementAndWaitFor(clickTarget, target, getElement, abortController)
+		}
+
+	}
+
+	/** @module ui-message UI element representing a message */
+
+
+	class UIMessage extends UIComponent {
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<HTMLButtonElement>}
+		 */
+		async showActionsMenuButton(abortController) {
+			console.debug("Workflow step 1 : showActionsMenuButton", this.root);
+			this.root.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+			this.root.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+			this.root.dispatchEvent(new MouseEvent("mousenter", { bubbles: true }));
+			const waitAbortController = new AbortController();
+			let promiseTimeout;
+			const abortHandler = () => {
+				waitAbortController.abort();
+				clearTimeout(promiseTimeout);
+			};
+			abortController.signal.addEventListener("abort", abortHandler);
+			const actionButton = await Promise.race([
+				this.waitForElement(this.root, () => this.root.querySelector("[aria-label^='See more options for message']")?.parentNode, waitAbortController),
+				new Promise((resolve, reject) => {
+					promiseTimeout = setTimeout(() => reject("Timeout showActionsMenuButton"), 200);
+				})
+			]);
+			waitAbortController.abort();
+			clearTimeout(promiseTimeout);
+			return actionButton
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<boolean>}
+		 */
+		async hideActionMenuButton(abortController) { // FIXME
+			console.debug("hideActionMenuButton", this.root);
+			this.root.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+			this.root.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));
+			this.root.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+			const waitAbortController = new AbortController();
+			let promiseTimeout;
+			let resolveTimeout;
+			const abortHandler = () => {
+				waitAbortController.abort();
+				clearTimeout(promiseTimeout);
+				if(resolveTimeout) {
+					resolveTimeout();
+				}
+			};
+			abortController.signal.addEventListener("abort", abortHandler);
+			const result = await Promise.race([
+				this.waitForElement(this.root, () => this.root.querySelector("[aria-label=More]") === null, waitAbortController),
+				new Promise((resolve, reject) => {
+					resolveTimeout = resolve;
+					promiseTimeout = setTimeout(() => reject("Timeout hideActionMenuButton"), 200);
+				})
+			]);
+			waitAbortController.abort();
+			clearTimeout(promiseTimeout);
+			return result
+		}
+
+		/**
+		 *
+		 * @param {HTMLButtonElement} actionButton
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		async openActionsMenu(actionButton, abortController) {
+			console.debug("Workflow step 2 : Clicking actionButton and waiting for unsend menu item to appear", actionButton);
+			const waitAbortController = new AbortController();
+			let promiseTimeout;
+			const abortHandler = () => {
+				waitAbortController.abort();
+				clearTimeout(promiseTimeout);
+			};
+			abortController.signal.addEventListener("abort", abortHandler);
+			const unsendButton = await Promise.race([
+				this.clickElementAndWaitFor(
+					actionButton,
+					this.root.ownerDocument.body,
+					(mutations) => {
+						if(mutations) {
+							const addedNodes = [ ...mutations.map(mutation => [...mutation.addedNodes]) ].flat().filter(node => node.nodeType === 1);
+							console.debug("Workflow step 2 : ", addedNodes, addedNodes.find(node => node.textContent.trim().toLocaleLowerCase() === "unsend"));
+							for(const addedNode of addedNodes) {
+								const node = [...addedNode.querySelectorAll("span,div")].find(node => node.textContent.trim().toLocaleLowerCase() === "unsend" && node.firstChild?.nodeType === 3);
+								return node
+							}
+						}
+					},
+					waitAbortController
+				),
+				new Promise((resolve, reject) => {
+					promiseTimeout = setTimeout(() => reject("Timeout openActionsMenu"), 200);
+				})
+			]);
+			console.debug("Workflow step 2 : Found unsendButton", unsendButton);
+			waitAbortController.abort();
+			clearTimeout(promiseTimeout);
+			return unsendButton
+		}
+
+		/**
+		 *
+		 * @param {HTMLButtonElement} actionButton
+		 * @param {HTMLDivElement} actionsMenuElement
+		 * @param {AbortController} abortController
+		 * @returns {Promise<boolean>}
+		 */
+		async closeActionsMenu(actionButton, actionsMenuElement, abortController) {
+			console.debug("closeActionsMenu");
+			const waitAbortController = new AbortController();
+			let promiseTimeout;
+			const abortHandler = () => {
+				waitAbortController.abort();
+				clearTimeout(promiseTimeout);
+			};
+			abortController.signal.addEventListener("abort", abortHandler);
+			const result = await Promise.race([
+				this.clickElementAndWaitFor(
+					actionButton,
+					this.root.ownerDocument.body,
+					() => this.root.ownerDocument.body.contains(actionsMenuElement) === false,
+					abortController
+				),
+				new Promise((resolve, reject) => {
+					promiseTimeout = setTimeout(() => reject("Timeout openActionsMenu"), 200);
+				})
+			]);
+			waitAbortController.abort();
+			clearTimeout(promiseTimeout);
+			return result !== null
+		}
+
+		/**
+		 * Click unsend button
+		 * @param {HTMLSpanElement} unsendButton
+		 * @param {AbortController} abortController
+		 * @returns {Promise<HTMLButtonElement>|Promise<Error>}
+		 */
+		openConfirmUnsendModal(unsendButton, abortController) {
+			console.debug("Workflow step 3 : Clicking unsendButton and waiting for dialog to appear...");
+			return this.clickElementAndWaitFor(
+				unsendButton,
+				this.root.ownerDocument.body,
+				() => this.root.ownerDocument.querySelector("[role=dialog] button"),
+				abortController
+			)
+		}
+
+		/**
+		 * Click unsend confirm button
+		 * @param {HTMLButtonElement} dialogButton
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		async confirmUnsend(dialogButton, abortController) {
+			console.debug("Workflow final step : confirmUnsend", dialogButton);
+			// wait until confirm button is removed
+			await this.clickElementAndWaitFor(
+				dialogButton,
+				this.root.ownerDocument.body,
+				() => this.root.ownerDocument.querySelector("[role=dialog] button") === null,
+				abortController
+			);
+		}
+
+	}
+
+	/** @module uipi-message API for UIMessage */
+
+
+	class FailedWorkflowException extends Error {}
+
+	class UIPIMessage {
+
+		/**
+		 * @param {UIMessage} uiMessage
+		 */
+		constructor(uiMessage) {
+			this._uiMessage = uiMessage;
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<boolean>}
+		 */
+		async unsend(abortController) { // TODO abort UIPI / waitForElement etc..
+			console.debug("UIPIMessage unsend");
+			let actionButton;
+			let unsendButton;
+			try {
+				actionButton = await this.uiMessage.showActionsMenuButton(abortController);
+				unsendButton = await this.uiMessage.openActionsMenu(actionButton, abortController);
+				console.debug("unsendButton", unsendButton);
+				const dialogButton = await this.uiMessage.openConfirmUnsendModal(unsendButton, abortController);
+				await this.uiMessage.confirmUnsend(dialogButton, abortController);
+				this.uiMessage.root.setAttribute("data-idmu-unsent", "");
+				return true
+			} catch(ex) {
+				console.error(ex);
+				this.uiMessage.root.setAttribute("data-idmu-ignore", "");
+				throw new FailedWorkflowException("Failed to execute workflow for this message", ex)
+			}
+		}
+
+		/**
+		 * @type {UIMessage}
+		 */
+		get uiMessage() {
+			return this._uiMessage
+		}
+
+	}
+
+	/**
+	 *
+	 * @abstract
+	 */
+	class UI extends UIComponent {
+
+		/**
+		 *
+		 * @abstract
+		 * @returns {UI}
+		 */
+		static create() {
+		}
+
+		/**
+		 *
+		 * @abstract
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		/* eslint-disable-next-line no-unused-vars */
+		async fetchAndRenderThreadNextMessagePage(abortController) {
+		}
+
+		/**
+		 *
+		 * @abstract
+		 * @returns {Promise<UIPIMessage>}
+		 */
+		async getNextUIPIMessage() {
+		}
+
+	}
+
+	/** @module dom-lookup Utils module for looking up elements on the default UI */
+
+
+	/**
+	 *
+	 * @param {Element} root
+	 * @param {AbortController} abortController
+	 * @returns {Promise<Element[]>}
+	 */
+	function getFirstVisibleMessage(root, abortController) {
+		const elements = [...root.querySelectorAll("div[role=row]:not([data-idmu-ignore])")]
+			.filter(d => d.textContent.length > 3 && d.textContent.substring(0, 3) === "You");
+		elements.reverse();
+		console.debug("getFirstVisibleMessage", elements.length, "elements");
+		for(const element of elements) {
+			if(abortController.signal.aborted) {
+				break
+			}
+			const visibilityCheck = element.checkVisibility({
+				visibilityProperty: true,
+				contentVisibilityAuto: true,
+				opacityProperty: true,
+			});
+			if(visibilityCheck === false) {
+				console.debug("visibilityCheck", visibilityCheck);
+				continue
+			}
+			const isInView = element.getBoundingClientRect().y > 100;
+			if(isInView === false) {
+				console.debug("isInView", isInView);
+				continue
+			}
+			element.setAttribute("data-idmu-ignore", ""); // Next iteration should not include this message
+			console.debug("Message in view, testing workflow...", element);
+			return element
+		}
+	}
+
+	/**
+	 *
+	 * @param {Window} window
+	 * @returns {HTMLDivElement}
+	 */
+	function findMessagesWrapper(window) {
+		return window.document.querySelector("div[role=grid] > div > div > div > div")
+	}
+
+	/**
+	 *
+	 * @param {Element} root
+	 * @param {AbortController} abortController
+	 * @returns {Promise<boolean>}
+	 */
+	async function loadMoreMessages(root, abortController) {
+		console.debug("loadMoreMessages looking for loader... ");
+		let findLoaderTimeout;
+		let loadingElement;
+		let resolveTimeout;
+		const scrollAbortController = new AbortController(); // Separate abortController to stop scrolling if we can't find the loader in 10s
+		const abortHandler = () => {
+			scrollAbortController.abort();
+			clearTimeout(findLoaderTimeout);
+			if(resolveTimeout) {
+				resolveTimeout();
+			}
+		};
+		abortController.signal.addEventListener("abort", abortHandler);
+		root.scrollTop = 0;
+		try {
+			loadingElement = await Promise.race([
+				waitForElement(root, () => {
+					if(root.querySelector(`[role=progressbar]`) === null) {
+						root.scrollTop = 0;
+					}
+					return root.querySelector(`[role=progressbar]`)
+				}, scrollAbortController),
+				new Promise(resolve => {
+					resolveTimeout = resolve;
+					findLoaderTimeout = setTimeout(() => { // TODO Replace with fetch override
+						resolve();
+					}, 10000); // IDMU_SCROLL_DETECTION_TIMEOUT
+				})
+			]);
+		} catch(ex) {
+			console.error(ex);
+		}
+		scrollAbortController.abort(); // If it took more than 10s stop scrolling
+		abortController.signal.removeEventListener("abort", abortHandler);
+		clearTimeout(findLoaderTimeout);
+		if(loadingElement && loadingElement !== true) {
+			console.debug("loadMoreMessages: Found loader; Stand-by until it is removed");
+			console.debug("loadMoreMessages: scrollTop", root.scrollTop);
+			await waitForElement(root, () => root.querySelector(`[role=progressbar]`) === null, abortController);
+		}
+		console.debug("loadMoreMessages: Loader was removed, older messages loading completed");
+		console.debug(`loadMoreMessages: scrollTop is ${root.scrollTop} we ${root.scrollTop === 0 ? "reached last page" : "did not reach last page and will begin loading older messages shortly"}`, );
+		return root.scrollTop === 0
+	}
+
+	/** @module ui-messages-wrapper UI element representing the messages wrapper */
+
+
+	class UIMessagesWrapper extends UIComponent {
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		fetchAndRenderThreadNextMessagePage(abortController) {
+			return loadMoreMessages(this.root, abortController)
+		}
+
+	}
+
+	/** @module default-ui Default UI / English UI */
+
+
+	class DefaultUI extends UI {
+
+		constructor(root, identifier={}) {
+			super(root, identifier);
+			this.lastScrollTop = null;
+		}
+
+		/**
+		 * @param {Window} window
+		 * @returns {DefaultUI}
+		 */
+		static create(window) {
+			console.debug("UI create");
+			const messagesWrapperElement = findMessagesWrapper(window);
+			if(messagesWrapperElement !== null) {
+				console.debug("Found messagesWrapperElement", messagesWrapperElement);
+				const uiMessagesWrapper = new UIMessagesWrapper(messagesWrapperElement);
+				return new DefaultUI(window, { uiMessagesWrapper })
+			} else {
+				throw new Error("Unable to find messagesWrapperElement")
+			}
+		}
+
+		/**
+		* @param {AbortController} abortController
+		* @returns {Promise}
+		*/
+		async fetchAndRenderThreadNextMessagePage(abortController) {
+			console.debug("UI fetchAndRenderThreadNextMessagePage");
+			return await this.identifier.uiMessagesWrapper.fetchAndRenderThreadNextMessagePage(abortController)
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<UIPIMessage>}
+		 */
+		async getNextUIPIMessage(abortController) {
+			console.debug("UI getNextUIPIMessage", this.lastScrollTop);
+			const uiMessagesWrapperRoot = this.identifier.uiMessagesWrapper.root;
+			const startScrollTop = this.lastScrollTop || uiMessagesWrapperRoot.scrollHeight - uiMessagesWrapperRoot.clientHeight;
+			console.debug("startScrollTop", startScrollTop);
+			for(let i = Math.max(1, startScrollTop);i > 0;i = i - 30 ) {
+				if(abortController.signal.aborted) {
+					break
+				}
+				this.lastScrollTop = i;
+				uiMessagesWrapperRoot.scrollTop = i;
+				uiMessagesWrapperRoot.dispatchEvent(new this.root.Event("scroll"));
+				console.debug("scroll");
+				await new Promise(resolve => setTimeout(resolve, 20));
+				try {
+					const messageElement = getFirstVisibleMessage(uiMessagesWrapperRoot, abortController);
+					if(messageElement) {
+						const uiMessage = new UIMessage(messageElement);
+						return new UIPIMessage(uiMessage)
+					}
+				} catch(ex) {
+					console.error(ex);
+				}
+			}
+			// TODO throw endOfScrollException
+			return false // end of scroll reached
+		}
+
+	}
+
+	/** @module get-ui UI loader module. Allow loading of a certain UI based on a given strategy (locale etc..)
+	 * There might be need for multiple UI as Instagram might serve different apps based on location for example.
+	 * There is also a need to internationalize each ui so that it doesn't fail if we change the language.
+	 */
+
+
+	/**
+	 *
+	 * @returns {UI}
+	 */
+	function getUI() {
+		return DefaultUI
+	}
+
+	/** @module uipi API for UI */
+
+
+	/**
+	 * UI Interface API
+	 */
+	class UIPI {
+
+		/**
+		 *
+		 * @param {UI} ui
+		 */
+		constructor(ui) {
+			this._ui = ui;
+		}
+
+		/**
+		 *
+		 * @param {Window} window
+		 * @returns {UIPI}
+		 */
+		static create(window) {
+			console.debug("UIPI.create");
+			const ui = getUI().create(window);
+			return new UIPI(ui)
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		fetchAndRenderThreadNextMessagePage(abortController) {
+			console.debug("UIPI fetchAndRenderThreadNextMessagePage");
+			return this.ui.fetchAndRenderThreadNextMessagePage(abortController)
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<UIPIMessage>}
+		 */
+		getNextUIPIMessage(abortController) {
+			console.debug("UIPI getNextUIPIMessage");
+			return this.ui.getNextUIPIMessage(abortController)
+		}
+
+		/**
+		 *
+		 * @type {UI}
+		 */
+		get ui() {
+			return this._ui
+		}
+
+	}
+
+	/** @module idmu Global/Main API for interacting with the UI */
+
+
+	class IDMU {
+
+		/**
+		 *
+		 * @param {Window} window
+		 * @param {callback} onStatusText
+		 */
+		constructor(window, onStatusText) {
+			this.window = window;
+			this.uipi = null;
+			this.onStatusText = onStatusText;
+		}
+
+		/**
+		 * @param {AbortController} abortController
+		 * @returns {Promise<UIPIMessage>}
+		 */
+		getNextUIPIMessage(abortController) {
+			return this.uipi.getNextUIPIMessage(abortController)
+		}
+
+		/**
+		 *
+		 * @param {string} text
+		 */
+		setStatusText(text) {
+			this.onStatusText(text);
+		}
+
+
+		/**
+		 *
+		 * @param {AbortController} abortController
+		 * @returns {Promise}
+		 */
+		fetchAndRenderThreadNextMessagePage(abortController) {
+			return this.uipi.fetchAndRenderThreadNextMessagePage(abortController)
+		}
+
+		/**
+		 * Map Instagram UI
+		 */
+		loadUIPI() {
+			console.debug("loadUIPI");
+			this.uipi = UIPI.create(this.window);
+		}
+
+
+	}
+
+	/** @module unsend-strategy Various strategies for unsending messages */
+
+
+	/**
+	 *
+	 * @abstract
+	 */
+	class UnsendStrategy {
+
+		/**
+		 *
+		 * @param {IDMU} idmu
+		 */
+		constructor(idmu) {
+			this._idmu = idmu;
+		}
+
+		/**
+		 *
+		 * @abstract
+		 * @returns {boolean}
+		 */
+		isRunning() {
+		}
+
+		/**
+		 *
+		 * @abstract
+		 */
+		stop() {
+		}
+
+		/**
+		 *
+		 * @abstract
+		 */
+		reset() {
+		}
+
+		/**
+		 *
+		 * @abstract
+		 */
+		async run() {
+		}
+
+		/**
+		 * @readonly
+		 * @type {IDMU}
+		 */
+		get idmu() {
+			return this._idmu
+		}
+
+	}
+
+	/** @module unsend-strategy Various strategies for unsending messages */
+
+
+	/**
+	 * Loads multiple pages before unsending message
+	 */
+	class DefaultStrategy extends UnsendStrategy {
+
+		/**
+		 * @param {IDMU} idmu
+		 */
+		constructor(idmu) {
+			super(idmu);
+			this._allPagesLoaded = false;
+			this._unsentCount = 0;
+			this._pagesLoadedCount = 0;
+			this._running = false;
+			this._abortController = null;
+			this._lastUnsendDate = null;
+		}
+
+		/**
+		 *
+		 * @returns {boolean}
+		 */
+		isRunning() {
+			return this._running && this._abortController && this._abortController.signal.aborted === false
+		}
+
+		stop() {
+			console.debug("DefaultStrategy stop");
+			this.idmu.setStatusText("Stopping...");
+			this._abortController.abort();
+		}
+
+		reset() {
+			this._allPagesLoaded = false;
+			this._unsentCount = 0;
+			this._lastUnsendDate = null;
+			this._pagesLoadedCount = 0;
+			this.idmu.setStatusText("Ready");
+		}
+
+		/**
+		 *
+		 * @returns {Promise}
+		 */
+		async run() {
+			console.debug("DefaultStrategy.run()");
+			this._unsentCount = 0;
+			this._pagesLoadedCount = 0;
+			this._running = true;
+			this._abortController = new AbortController();
+			this.idmu.loadUIPI();
+			try {
+				if(this._allPagesLoaded) {
+					await this.#unsendNextMessage();
+				} else {
+					await this.#loadNextPage();
+				}
+				if(this._abortController.signal.aborted) {
+					this.idmu.setStatusText(`Aborted. ${this._unsentCount} message(s) unsent.`);
+					console.debug("DefaultStrategy aborted");
+				} else {
+					this.idmu.setStatusText(`Done. ${this._unsentCount} message(s) unsent.`);
+					console.debug("DefaultStrategy done");
+				}
+			} catch(ex) {
+				console.error(ex);
+				this.idmu.setStatusText(`Errored. ${this._unsentCount} message(s) unsent.`);
+				console.debug("DefaultStrategy errored");
+			}
+			this._running = false;
+		}
+
+		/**
+		 * Tries to load the thread next page
+		 */
+		async #loadNextPage() {
+			if(this._abortController.signal.aborted) {
+				return
+			}
+			this.idmu.setStatusText("Loading next page...");
+			try {
+				const done = await this.idmu.fetchAndRenderThreadNextMessagePage(this._abortController);
+				if(this._abortController.signal.aborted === false) {
+					if(done) {
+						this.idmu.setStatusText(`All pages loaded (${this._pagesLoadedCount} in total)...`);
+						this._allPagesLoaded = true;
+						await this.#unsendNextMessage();
+					} else {
+						this._pagesLoadedCount++;
+						await this.#loadNextPage();
+					}
+				}
+			} catch(ex) {
+				console.error(ex);
+			}
+		}
+
+		/**
+		 * Unsend first message in viewport
+		 */
+		async #unsendNextMessage() {
+			if(this._abortController.signal.aborted) {
+				return
+			}
+			let canScroll = true;
+			try {
+				this.idmu.setStatusText("Retrieving next message...");
+				const uipiMessage = await this.idmu.getNextUIPIMessage(this._abortController);
+				canScroll = uipiMessage !== false;
+				if(uipiMessage) {
+					this.idmu.setStatusText("Unsending message...");
+					if (this._lastUnsendDate !== null) {
+						const lastUnsendDateDiff = new Date().getTime() - this._lastUnsendDate.getTime();
+						if(lastUnsendDateDiff < 1000) {
+							this.idmu.setStatusText(`Waiting ${lastUnsendDateDiff}ms before unsending next message...`);
+							await new Promise(resolve => setTimeout(resolve, lastUnsendDateDiff));
+						}
+					}
+					const unsent = await uipiMessage.unsend(this._abortController);
+					if(unsent) {
+						this._lastUnsendDate = new Date();
+						this._unsentCount++;
+					}
+				}
+			} catch(ex) {
+				console.error(ex);
+			} finally {
+				if(canScroll) {
+					await this.#unsendNextMessage();
+				}
+			}
+		}
+
+	}
+
+	/** @module alert Alert UI */
+
+	/**
+	 *
+	 * @param {Document} document
+	 * @returns {HTMLButtonElement}
+	 */
+	function createAlertsWrapperElement(document) {
+		const alertsWrapperElement = document.createElement("div");
+		alertsWrapperElement.id = "idmu-alerts";
+		alertsWrapperElement.style.position = "fixed";
+		alertsWrapperElement.style.top = "20px";
+		alertsWrapperElement.style.right = "20px";
+		alertsWrapperElement.style.display = "grid";
+		return alertsWrapperElement
+	}
+
+	/** @module overlay IDMU's overlay */
+
+	/**
+	 * @param {Document} document
+	 * @returns {HTMLDivElement}
+	 */
+	function createOverlayElement(document) {
+		const overlayElement = document.createElement("div");
+		overlayElement.id = "idmu-overlay";
+		overlayElement.tabIndex = 0;
+		overlayElement.style.top = "0";
+		overlayElement.style.right = "0";
+		overlayElement.style.position = "fixed";
+		overlayElement.style.width = "100vw";
+		overlayElement.style.height = "100vh";
+		overlayElement.style.zIndex = "998";
+		overlayElement.style.backgroundColor = "#000000d6";
+		overlayElement.style.display = "none";
+		return overlayElement
+	}
+
+	/** @module ui IDMU's own ui/overlay
+	 * Provide a button to unsend messages
+	 */
+
+
+	class OSD {
+		/**
+		 *
+		 * @param {Document} document
+		 * @param {HTMLDivElement} root
+		 * @param {HTMLDivElement} overlayElement
+		 * @param {HTMLDivElement} menuElement
+		 * @param {HTMLButtonElement} unsendThreadMessagesButton
+		 * @param {HTMLDivElement} statusElement
+		 */
+		constructor(document, root, overlayElement, menuElement, unsendThreadMessagesButton, statusElement) {
+			this._document = document;
+			this._root = root;
+			this._overlayElement = overlayElement;
+			this._menuElement = menuElement;
+			this._statusElement = statusElement;
+			this._unsendThreadMessagesButton = unsendThreadMessagesButton;
+			this._idmu = new IDMU(this.window, this.onStatusText.bind(this));
+			this._strategy = new DefaultStrategy(this._idmu); // TODO move out
+		}
+
+		/**
+		 *
+		 * @param {window} window
+		 * @returns {OSD}
+		 */
+		static render(window) {
+			console.debug("render");
+			const ui = OSD.create(window.document);
+			window.document.body.appendChild(ui.root);
+			return ui
+		}
+
+		/**
+		 *
+		 * @param   {Document} document
+		 * @returns {OSD}
+		 */
+		static create(document) {
+			const root = document.createElement("div");
+			root.id = "idmu-root";
+			const menuElement = createMenuElement(document);
+			const overlayElement = createOverlayElement(document);
+			const alertsWrapperElement = createAlertsWrapperElement(document);
+			const unsendThreadMessagesButton = createMenuButtonElement(document, "Unsend all DMs", BUTTON_STYLE.PRIMARY);
+			const statusElement = document.createElement("div");
+			statusElement.textContent = "Ready";
+			statusElement.id = "idmu-status";
+			statusElement.style = "width: 200px";
+			document.body.appendChild(overlayElement);
+			document.body.appendChild(alertsWrapperElement);
+			menuElement.appendChild(unsendThreadMessagesButton);
+			menuElement.appendChild(statusElement);
+			root.appendChild(menuElement);
+			const ui = new OSD(document, root, overlayElement, menuElement, unsendThreadMessagesButton, statusElement);
+			document.addEventListener("keydown", (event) => ui.#onWindowKeyEvent(event)); // TODO test
+			document.addEventListener("keyup", (event) => ui.#onWindowKeyEvent(event)); // TODO test
+			unsendThreadMessagesButton.addEventListener("click", (event) => ui.#onUnsendThreadMessagesButtonClick(event));
+			ui._mutationObserver = new MutationObserver((mutations) => ui.#onMutations(ui, mutations));
+			ui._mutationObserver.observe(document.body, { childList: true }); // TODO test
+			unsendThreadMessagesButton.dataTextContent = unsendThreadMessagesButton.textContent;
+			unsendThreadMessagesButton.dataBackgroundColor = unsendThreadMessagesButton.style.backgroundColor;
+			return ui
+		}
+
+		/**
+		 *
+		 * @param {string} text
+		 */
+		onStatusText(text) {
+			this.statusElement.textContent = text;
+		}
+
+		async #startUnsending() {
+	[...this.menuElement.querySelectorAll("button")].filter(button => button !== this.unsendThreadMessagesButton).forEach(button => {
+				button.style.visibility = "hidden";
+				button.disabled = true;
+			});
+			this.overlayElement.style.display = "";
+			this.overlayElement.focus();
+			this.unsendThreadMessagesButton.textContent = "Stop processing";
+			this.unsendThreadMessagesButton.style.backgroundColor = "#FA383E";
+			this.statusElement.style.color = "white";
+			this._mutationObserver.disconnect();
+			await this.strategy.run();
+			this.#onUnsendingFinished();
+		}
+
+		/**
+		 *
+		 * @param {OSD} ui
+		 */
+		#onMutations(ui) {
+			if(ui.root.ownerDocument.querySelector("[id^=mount] > div > div > div") !== null && ui) {
+				if(this._mutationObserver) {
+					this._mutationObserver.disconnect();
+				}
+				this._mutationObserver = new MutationObserver(ui.#onMutations.bind(this, ui));
+				this._mutationObserver.observe(ui.root.ownerDocument.querySelector("[id^=mount] > div > div > div"), { childList: true, attributes: true });
+			}
+			if(this.window.location.pathname.startsWith("/direct/t/")) {
+				if(!this.strategy.isRunning()) {
+					this.strategy.reset();
+				}
+				this.root.style.display = "";
+			} else {
+				this.root.style.display = "none";
+				if(this.strategy.isRunning()) {
+					this.strategy.stop();
+				}
+			}
+		}
+
+		/**
+		 *
+		 * @param {OSD} ui
+		 * @param {Event} event
+		 */
+		#onUnsendThreadMessagesButtonClick() {
+			if(this.strategy.isRunning()) {
+				console.debug("User asked for messages unsending to stop");
+				this.strategy.stop();
+				this.#onUnsendingFinished();
+			} else {
+				console.debug("User asked for messages unsending to start; UI interaction will be disabled in the meantime");
+				this.#startUnsending();
+			}
+		}
+
+		/**
+		 *
+		 * @param {Event} event
+		 * @returns {boolean}
+		 */
+		#onWindowKeyEvent(event) {
+			if(this.strategy.isRunning()) {
+				console.log("User interaction is disabled as the unsending is still running; Please stop the execution first.");
+				event.stopImmediatePropagation();
+				event.preventDefault();
+				event.stopPropagation();
+				this.overlayElement.focus();
+				return false
+			}
+		}
+
+		#onUnsendingFinished() {
+			console.debug("render onUnsendingFinished")
+			;[...this.menuElement.querySelectorAll("button")].filter(button => button !== this.unsendThreadMessagesButton).forEach(button => {
+				button.style.visibility = "";
+				button.disabled = false;
+			});
+			this.unsendThreadMessagesButton.textContent = this.unsendThreadMessagesButton.dataTextContent;
+			this.unsendThreadMessagesButton.style.backgroundColor = this.unsendThreadMessagesButton.dataBackgroundColor;
+			this.overlayElement.style.display = "none";
+			this.statusElement.style.color = "";
+			this._mutationObserver.observe(this._document.body, { childList: true }); // TODO test
+		}
+
+		/**
+		 * @readonly
+		 * @type {Document}
+		 */
+		get document() {
+			return this._document
+		}
+
+		/**
+		 * @readonly
+		 * @type {Window}
+		 */
+		get window() {
+			return this._document.defaultView
+		}
+
+		/**
+		 * @readonly
+		 * @type {HTMLDivElement}
+		 */
+		get root() {
+			return this._root
+		}
+
+		/**
+		 * @readonly
+		 * @type {HTMLDivElement}
+		 */
+		get overlayElement() {
+			return this._overlayElement
+		}
+
+		/**
+		 * @readonly
+		 * @type {HTMLDivElement}
+		 */
+		get menuElement() {
+			return this._menuElement
+		}
+
+		/**
+		 * @readonly
+		 * @type {HTMLButtonElement}
+		 */
+		get unsendThreadMessagesButton() {
+			return this._unsendThreadMessagesButton
+		}
+
+		/**
+		 * @readonly
+		 * @type {HTMLDivElement}
+		 */
+		get statusElement() {
+			return this._statusElement
+		}
+
+		/**
+		 * @readonly
+		 * @type {UnsendStrategy}
+		 */
+		get strategy() { // TODO move out
+			return this._strategy
+		}
+
+		/**
+		 * @readonly
+		 * @type {IDMU}
+		 */
+		get idmu() {
+			return this._idmu
+		}
+
+	}
+
+	/** @module main Main module */
+
+
+	/**
+	 * @param {Window} window
+	 */
+	function main(window) {
+		OSD.render(window);
+	}
+
+	if(typeof window !== "undefined") {
+		main(window);
+	}
+
+	exports.main = main;
+
+	return exports;
+
+})({});
